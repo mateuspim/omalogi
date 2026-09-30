@@ -76,6 +76,8 @@ pub enum AssetError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Picture {
     pub depot: String,
+    /// Both checked alternate renders exist in the asset index.
+    pub has_white: bool,
     /// Whether hotspots are mapped to onboard slots; false for unverified devices.
     pub slots_verified: bool,
     pub views: Vec<View>,
@@ -105,6 +107,8 @@ pub struct Options {
     pub offline: bool,
     /// Download the index again, and any file that changed upstream.
     pub refresh: bool,
+    /// Select the white render when the asset index has both views.
+    pub white: bool,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +270,10 @@ pub fn load(
             source,
         })?;
     let slots_verified = VERIFIED_DEPOTS.contains(&depot.as_str());
+    let has_white = VIEWS.iter().all(|(_, _, name)| {
+        let white = name.replace(".png", "_white.png");
+        device.files.iter().any(|listed| listed.name == white)
+    });
     let mut views = Vec::new();
     for image in &metadata.images {
         let Some(&(_, name, file_name)) = VIEWS.iter().find(|(key, ..)| *key == image.key) else {
@@ -274,7 +282,12 @@ pub fn load(
         if image.origin.width <= 0.0 || image.origin.height <= 0.0 {
             continue;
         }
-        let image_path = file(file_name)?;
+        let white_name = file_name.replace(".png", "_white.png");
+        let image_path = file(if options.white && has_white {
+            &white_name
+        } else {
+            file_name
+        })?;
         let hotspots = if slots_verified {
             image
                 .assignments
@@ -300,6 +313,7 @@ pub fn load(
     }
     Ok(Picture {
         depot: depot.clone(),
+        has_white,
         slots_verified,
         views,
     })
@@ -382,6 +396,8 @@ mod tests {
 
     const FRONT: &[u8] = b"front picture";
     const SIDE: &[u8] = b"side picture";
+    const FRONT_WHITE: &[u8] = b"white front picture";
+    const SIDE_WHITE: &[u8] = b"white side picture";
 
     struct TempDir(PathBuf);
 
@@ -438,6 +454,24 @@ mod tests {
         ])
     }
 
+    fn host_with_white(depot: &str) -> BTreeMap<String, Vec<u8>> {
+        let mut files = host(depot, FRONT);
+        let mut index: serde_json::Value = serde_json::from_slice(&files["index.json"]).unwrap();
+        let listed_files = index["devices"][depot]["files"].as_array_mut().unwrap();
+        listed_files.push(listed("front_white.png", FRONT_WHITE));
+        listed_files.push(listed("side_white.png", SIDE_WHITE));
+        files.insert("index.json".to_owned(), serde_json::to_vec(&index).unwrap());
+        files.insert(
+            format!("v1/devices/{depot}/front_white.png"),
+            FRONT_WHITE.to_vec(),
+        );
+        files.insert(
+            format!("v1/devices/{depot}/side_white.png"),
+            SIDE_WHITE.to_vec(),
+        );
+        files
+    }
+
     fn serve<'a>(
         files: &'a BTreeMap<String, Vec<u8>>,
         requests: &'a RefCell<Vec<String>>,
@@ -451,10 +485,12 @@ mod tests {
     const ONLINE: Options = Options {
         offline: false,
         refresh: false,
+        white: false,
     };
     const OFFLINE: Options = Options {
         offline: true,
         refresh: false,
+        white: false,
     };
 
     #[test]
@@ -465,6 +501,7 @@ mod tests {
         let picture = load(&dir.0, 0xC099, ONLINE, serve(&files, &requests)).unwrap();
         assert_eq!(requests.borrow().len(), 4);
         assert!(picture.slots_verified);
+        assert!(!picture.has_white);
         assert_eq!(picture.views.len(), 2);
         let front = &picture.views[0];
         assert_eq!(front.name, "front");
@@ -489,6 +526,44 @@ mod tests {
             requests.borrow().is_empty(),
             "a complete cache needs no downloads"
         );
+    }
+
+    #[test]
+    fn selects_checked_white_renders_and_keeps_the_same_hotspots() {
+        let dir = TempDir::new("white");
+        let files = host_with_white("g502x");
+        let requests = RefCell::new(Vec::new());
+        let black = load(&dir.0, 0xC099, ONLINE, serve(&files, &requests)).unwrap();
+        assert!(black.has_white);
+        assert_eq!(black.views[0].hotspots[0].slot, 0);
+        assert_eq!(black.views[1].hotspots[0].slot, 3);
+        let white = load(
+            &dir.0,
+            0xC099,
+            Options {
+                white: true,
+                ..ONLINE
+            },
+            serve(&files, &requests),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&white.views[0].image).unwrap(), FRONT_WHITE);
+        assert_eq!(fs::read(&white.views[1].image).unwrap(), SIDE_WHITE);
+        assert_eq!(white.views[0].hotspots, black.views[0].hotspots);
+        assert_eq!(white.views[1].hotspots, black.views[1].hotspots);
+        requests.borrow_mut().clear();
+        let again = load(
+            &dir.0,
+            0xC099,
+            Options {
+                white: true,
+                ..OFFLINE
+            },
+            serve(&files, &requests),
+        )
+        .unwrap();
+        assert_eq!(again, white);
+        assert!(requests.borrow().is_empty());
     }
 
     #[test]
